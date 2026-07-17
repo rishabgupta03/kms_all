@@ -25,7 +25,15 @@ from botocore.exceptions import ClientError
 def get_session(role_arn=None):
     if role_arn:
         base = boto3.Session()
-        sts = base.client("sts")
+        # Use a REGIONAL STS endpoint (not the global sts.amazonaws.com
+        # endpoint) when assuming the role. Tokens minted by the global
+        # STS endpoint are not always recognized in newer "opt-in"
+        # regions (e.g. ap-south-2), which causes
+        # UnrecognizedClientException: "The security token included in
+        # the request is invalid" even when the region is enabled on
+        # the account. Requesting from a regional STS endpoint avoids
+        # this issue for all opted-in regions.
+        sts = base.client("sts", region_name="us-east-1")
         assumed = sts.assume_role(
             RoleArn=role_arn,
             RoleSessionName="control-audit"
