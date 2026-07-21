@@ -13,6 +13,10 @@ AWS scripts as closely as GCP's APIs allow.
 
 Requires: pip install google-cloud-kms --break-system-packages
 
+Usage:
+    python kms_key_not_publicly_accessible.py -P your-gcp-project-id
+    python kms_key_not_publicly_accessible.py -P your-gcp-project-id -C /path/to/service-account.json
+
 Checks every Cloud KMS CryptoKey in every location in the given project and
 verifies that its IAM policy does not grant any role to the special members
 "allUsers" (public/anonymous internet access) or "allAuthenticatedUsers"
@@ -21,12 +25,43 @@ verifies that its IAM policy does not grant any role to the special members
 
 import argparse
 import csv
-from datetime import datetime
-from tqdm import tqdm
+import sys
+from datetime import datetime, timezone
 
-from google.cloud import kms_v1
-from google.oauth2 import service_account
-from google.api_core.exceptions import GoogleAPICallError
+# ==================================================
+# DEPENDENCY CHECK (fail fast with a clear message instead of a raw
+# traceback if google-cloud-kms isn't installed in this environment)
+# ==================================================
+try:
+    from tqdm import tqdm
+except ImportError:
+    print(
+        "\nERROR: The 'tqdm' package is not installed in this Python environment.\n"
+        "Fix with:\n"
+        "    pip install tqdm --break-system-packages\n"
+    )
+    sys.exit(1)
+
+try:
+    from google.cloud import kms_v1
+    from google.oauth2 import service_account
+    from google.api_core.exceptions import GoogleAPICallError
+except ImportError:
+    print(
+        "\nERROR: The 'google-cloud-kms' package is not installed (or not installed\n"
+        "in the Python interpreter currently running this script).\n\n"
+        "Fix with:\n"
+        "    pip install google-cloud-kms --break-system-packages\n\n"
+        "If it's already installed but this still fails, you likely have a stale\n"
+        "or conflicting 'google.cloud' namespace package. Clear it with:\n"
+        "    pip uninstall -y google-cloud-kms google-api-core google-cloud-core --break-system-packages\n"
+        "    pip install --upgrade google-cloud-kms --break-system-packages\n\n"
+        "Verify the fix with:\n"
+        "    python3 -c \"from google.cloud import kms_v1; print(kms_v1.__file__)\"\n"
+        "(it should print a real file path, not '(unknown location)')\n"
+    )
+    sys.exit(1)
+
 
 # ==================================================
 # AUTH
@@ -140,6 +175,10 @@ def check_control(client, project_id):
             for crypto_key in crypto_keys:
                 total_checked += 1
                 key_short_name = crypto_key.name.split("/")[-1]
+                # Include the key ring in the resource identifier so two keys
+                # with the same short name in different key rings aren't
+                # conflated in the report.
+                resource_uid = f"{key_ring_short_name}/{key_short_name}"
 
                 try:
                     policy = client.get_iam_policy(request={"resource": crypto_key.name})
@@ -150,7 +189,7 @@ def check_control(client, project_id):
                     results.append({
                         "Location": location,
                         "KeyRing": key_ring_short_name,
-                        "CryptoKeyName": key_short_name,
+                        "CryptoKeyName": resource_uid,
                         "ResourceName": crypto_key.name,
                         "Status": "SKIPPED",
                         "Evidence": evidence
@@ -171,7 +210,7 @@ def check_control(client, project_id):
                 results.append({
                     "Location": location,
                     "KeyRing": key_ring_short_name,
-                    "CryptoKeyName": key_short_name,
+                    "CryptoKeyName": resource_uid,
                     "ResourceName": crypto_key.name,
                     "Status": status,
                     "Evidence": evidence
@@ -184,7 +223,7 @@ def check_control(client, project_id):
 # CSV
 # ==================================================
 def write_csv(results, project_id):
-    timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     filename = f"gcp_kms_no_public_access_{project_id}_{timestamp}.csv"
 
     with open(filename, "w", newline="") as f:
