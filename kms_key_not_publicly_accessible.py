@@ -1,37 +1,38 @@
 #!/usr/bin/env python3
 """
-Control: Cloud KMS key does not grant access to allUsers or
-allAuthenticatedUsers.
+Control: KMS key does not grant access to everyone via its key policy
+(i.e. Principal "*" / {"AWS": "*"} without a restricting Condition).
 
-NOTE: This is a Google Cloud Platform control (Cloud KMS), not AWS. It uses
-a different SDK (google-cloud-kms) and a different auth model
-(service account credentials / Application Default Credentials instead of
-IAM role assumption), since GCP has no equivalent of an AWS IAM role ARN or
-STS AssumeRole. The overall script shape (AUTH / LOCATIONS / HELPERS /
-CONTROL LOGIC / CSV / MAIN, counters, tqdm, CLI summary block) mirrors your
-AWS scripts as closely as GCP's APIs allow.
-
-Requires: pip install google-cloud-kms --break-system-packages
+Requires: pip install boto3 tqdm --break-system-packages
 
 Usage:
-    python kms_key_not_publicly_accessible.py -P your-gcp-project-id
-    python kms_key_not_publicly_accessible.py -P your-gcp-project-id -C /path/to/service-account.json
+    python kms_key_not_publicly_accessible_aws.py -R arn:aws:iam::<ACCOUNT_ID>:role/<ROLE_NAME>
+    python kms_key_not_publicly_accessible_aws.py -R arn:aws:iam::<ACCOUNT_ID>:role/<ROLE_NAME> --regions us-east-1 us-west-2
 
-Checks every Cloud KMS CryptoKey in every location in the given project and
-verifies that its IAM policy does not grant any role to the special members
-"allUsers" (public/anonymous internet access) or "allAuthenticatedUsers"
-(any authenticated Google account, i.e. effectively public).
+Assumes the given IAM role via STS, then checks every customer-managed KMS
+key (AWS-managed keys are skipped, since you can't change their policy) in
+every enabled region and verifies its key policy does not grant kms:* (or
+any) permissions to Principal "*" / {"AWS": "*"} without a Condition that
+restricts access (e.g. kms:CallerAccount, aws:PrincipalAccount, aws:SourceArn).
 """
 
 import argparse
 import csv
+import json
 import sys
 from datetime import datetime, timezone
 
-# ==================================================
-# DEPENDENCY CHECK (fail fast with a clear message instead of a raw
-# traceback if google-cloud-kms isn't installed in this environment)
-# ==================================================
+try:
+    import boto3
+    from botocore.exceptions import ClientError, BotoCoreError
+except ImportError:
+    print(
+        "\nERROR: The 'boto3' package is not installed in this Python environment.\n"
+        "Fix with:\n"
+        "    pip install boto3 --break-system-packages\n"
+    )
+    sys.exit(1)
+
 try:
     from tqdm import tqdm
 except ImportError:
@@ -42,179 +43,182 @@ except ImportError:
     )
     sys.exit(1)
 
-try:
-    from google.cloud import kms_v1
-    from google.oauth2 import service_account
-    from google.api_core.exceptions import GoogleAPICallError
-except ImportError:
-    print(
-        "\nERROR: The 'google-cloud-kms' package is not installed (or not installed\n"
-        "in the Python interpreter currently running this script).\n\n"
-        "Fix with:\n"
-        "    pip install google-cloud-kms --break-system-packages\n\n"
-        "If it's already installed but this still fails, you likely have a stale\n"
-        "or conflicting 'google.cloud' namespace package. Clear it with:\n"
-        "    pip uninstall -y google-cloud-kms google-api-core google-cloud-core --break-system-packages\n"
-        "    pip install --upgrade google-cloud-kms --break-system-packages\n\n"
-        "Verify the fix with:\n"
-        "    python3 -c \"from google.cloud import kms_v1; print(kms_v1.__file__)\"\n"
-        "(it should print a real file path, not '(unknown location)')\n"
-    )
-    sys.exit(1)
-
 
 # ==================================================
 # AUTH
 # ==================================================
-def get_client(credentials_file=None):
-    """
-    Returns a KeyManagementServiceClient.
-    If --credentials-file is provided, uses that service account key.
-    Otherwise falls back to Application Default Credentials (e.g. a
-    GOOGLE_APPLICATION_CREDENTIALS env var, gcloud auth application-default
-    login, or attached workload identity).
-    """
-    if credentials_file:
-        creds = service_account.Credentials.from_service_account_file(
-            credentials_file,
-            scopes=["https://www.googleapis.com/auth/cloud-platform"]
-        )
-        return kms_v1.KeyManagementServiceClient(credentials=creds)
-    return kms_v1.KeyManagementServiceClient()
+def assume_role(role_arn, session_name="kms-public-access-audit"):
+    """Assumes the given IAM role via STS and returns a boto3 Session."""
+    sts = boto3.client("sts")
+    resp = sts.assume_role(RoleArn=role_arn, RoleSessionName=session_name)
+    creds = resp["Credentials"]
+    return boto3.Session(
+        aws_access_key_id=creds["AccessKeyId"],
+        aws_secret_access_key=creds["SecretAccessKey"],
+        aws_session_token=creds["SessionToken"],
+    )
 
 
 # ==================================================
-# LOCATIONS
+# REGIONS
 # ==================================================
-def get_locations(client, project_id):
-    """Returns all Cloud KMS locations available to this project."""
-    locations = []
-    request = {"name": f"projects/{project_id}"}
-    for location in client.list_locations(request=request):
-        locations.append(location.location_id)
-    return locations
+def get_regions(session, requested_regions=None):
+    """Returns the list of regions to scan (enabled regions, or a filtered subset)."""
+    ec2 = session.client("ec2", region_name="us-east-1")
+    all_regions = [r["RegionName"] for r in ec2.describe_regions(AllRegions=False)["Regions"]]
+    if requested_regions:
+        return [r for r in all_regions if r in requested_regions]
+    return all_regions
 
 
 # ==================================================
 # HELPERS
 # ==================================================
 def error_evidence(e):
-    """Classify a GoogleAPICallError into a short code + human-readable evidence string."""
-    code = getattr(e, "reason", None) or e.__class__.__name__
-    message = getattr(e, "message", str(e))
+    """Classify a boto3 ClientError into a short code + human-readable evidence string."""
+    if isinstance(e, ClientError):
+        code = e.response.get("Error", {}).get("Code", "ClientError")
+        message = e.response.get("Error", {}).get("Message", str(e))
+    else:
+        code = e.__class__.__name__
+        message = str(e)
     return code, f"{code}: {message}"[:200]
 
 
-PUBLIC_MEMBERS = {"allUsers", "allAuthenticatedUsers"}
+def statement_is_public(statement):
+    """
+    Returns True if a single policy statement grants access to everyone
+    (Principal '*' or {"AWS": "*"}) without a Condition narrowing it down.
+    """
+    if statement.get("Effect") != "Allow":
+        return False
+
+    principal = statement.get("Principal")
+    is_wildcard_principal = (
+        principal == "*"
+        or (isinstance(principal, dict) and principal.get("AWS") in ("*", ["*"]))
+    )
+    if not is_wildcard_principal:
+        return False
+
+    # A Condition block (e.g. restricting by kms:CallerAccount,
+    # aws:PrincipalAccount, aws:SourceArn, aws:SourceAccount) means the
+    # wildcard principal is actually scoped down, not truly public.
+    if statement.get("Condition"):
+        return False
+
+    return True
 
 
-def find_public_grants(policy):
-    """
-    Returns a list of 'role -> member' finding strings for any binding that
-    grants access to allUsers or allAuthenticatedUsers.
-    """
+def find_public_statements(policy_doc):
+    """Returns a list of 'Sid/Action -> Principal' finding strings for public statements."""
     findings = []
-    for binding in policy.bindings:
-        role = binding.role
-        for member in binding.members:
-            if member in PUBLIC_MEMBERS:
-                findings.append(f"{role} granted to {member}")
+    statements = policy_doc.get("Statement", [])
+    if isinstance(statements, dict):
+        statements = [statements]
+
+    for stmt in statements:
+        if statement_is_public(stmt):
+            sid = stmt.get("Sid", "NoSid")
+            actions = stmt.get("Action", "N/A")
+            if isinstance(actions, list):
+                actions = ",".join(actions)
+            findings.append(f"Sid={sid} Action={actions} Principal=*")
     return findings
 
 
 # ==================================================
 # CONTROL LOGIC
 # ==================================================
-def check_control(client, project_id):
-    locations = get_locations(client, project_id)
-
+def check_control(session, regions):
     results = []
     total_checked = 0
     compliant = 0
     non_compliant = 0
     skipped = 0
 
-    print(f"\nLocations to Scan: {len(locations)}\n")
+    print(f"\nRegions to Scan: {len(regions)}\n")
 
-    for location in tqdm(locations, desc="Scanning Locations"):
-        location_parent = f"projects/{project_id}/locations/{location}"
+    for region in tqdm(regions, desc="Scanning Regions"):
+        kms = session.client("kms", region_name=region)
 
         try:
-            key_rings = list(client.list_key_rings(request={"parent": location_parent}))
-        except GoogleAPICallError as e:
+            paginator = kms.get_paginator("list_keys")
+            keys = []
+            for page in paginator.paginate():
+                keys.extend(page["Keys"])
+        except (ClientError, BotoCoreError) as e:
             code, evidence = error_evidence(e)
             skipped += 1
             results.append({
-                "Location": location,
-                "KeyRing": "N/A",
-                "CryptoKeyName": "N/A",
-                "ResourceName": "N/A",
+                "Region": region,
+                "KeyId": "N/A",
+                "KeyArn": "N/A",
                 "Status": "SKIPPED",
                 "Evidence": evidence
             })
             continue
 
-        for key_ring in key_rings:
-            key_ring_short_name = key_ring.name.split("/")[-1]
+        for key in keys:
+            key_id = key["KeyId"]
+            key_arn = key["KeyArn"]
 
             try:
-                crypto_keys = list(client.list_crypto_keys(request={"parent": key_ring.name}))
-            except GoogleAPICallError as e:
+                describe = kms.describe_key(KeyId=key_id)
+                key_metadata = describe["KeyMetadata"]
+            except (ClientError, BotoCoreError) as e:
                 code, evidence = error_evidence(e)
                 skipped += 1
                 results.append({
-                    "Location": location,
-                    "KeyRing": key_ring_short_name,
-                    "CryptoKeyName": "N/A",
-                    "ResourceName": key_ring.name,
+                    "Region": region,
+                    "KeyId": key_id,
+                    "KeyArn": key_arn,
                     "Status": "SKIPPED",
                     "Evidence": evidence
                 })
                 continue
 
-            for crypto_key in crypto_keys:
-                total_checked += 1
-                key_short_name = crypto_key.name.split("/")[-1]
-                # Include the key ring in the resource identifier so two keys
-                # with the same short name in different key rings aren't
-                # conflated in the report.
-                resource_uid = f"{key_ring_short_name}/{key_short_name}"
+            # Skip AWS-managed keys (aws/*) - you cannot edit their policy,
+            # and they are not customer-controlled resources.
+            if key_metadata.get("KeyManager") == "AWS":
+                continue
 
-                try:
-                    policy = client.get_iam_policy(request={"resource": crypto_key.name})
-                except GoogleAPICallError as e:
-                    code, evidence = error_evidence(e)
-                    skipped += 1
-                    total_checked -= 1
-                    results.append({
-                        "Location": location,
-                        "KeyRing": key_ring_short_name,
-                        "CryptoKeyName": resource_uid,
-                        "ResourceName": crypto_key.name,
-                        "Status": "SKIPPED",
-                        "Evidence": evidence
-                    })
-                    continue
+            total_checked += 1
 
-                findings = find_public_grants(policy)
-
-                if not findings:
-                    status = "COMPLIANT"
-                    compliant += 1
-                    evidence = "No IAM bindings grant access to allUsers or allAuthenticatedUsers"
-                else:
-                    status = "NON_COMPLIANT"
-                    non_compliant += 1
-                    evidence = "; ".join(findings)
-
+            try:
+                policy_resp = kms.get_key_policy(KeyId=key_id, PolicyName="default")
+                policy_doc = json.loads(policy_resp["Policy"])
+            except (ClientError, BotoCoreError) as e:
+                code, evidence = error_evidence(e)
+                skipped += 1
+                total_checked -= 1
                 results.append({
-                    "Location": location,
-                    "KeyRing": key_ring_short_name,
-                    "CryptoKeyName": resource_uid,
-                    "ResourceName": crypto_key.name,
-                    "Status": status,
+                    "Region": region,
+                    "KeyId": key_id,
+                    "KeyArn": key_arn,
+                    "Status": "SKIPPED",
                     "Evidence": evidence
                 })
+                continue
+
+            findings = find_public_statements(policy_doc)
+
+            if not findings:
+                status = "COMPLIANT"
+                compliant += 1
+                evidence = "No key policy statements grant access to Principal '*' without a restricting Condition"
+            else:
+                status = "NON_COMPLIANT"
+                non_compliant += 1
+                evidence = "; ".join(findings)
+
+            results.append({
+                "Region": region,
+                "KeyId": key_id,
+                "KeyArn": key_arn,
+                "Status": status,
+                "Evidence": evidence
+            })
 
     return results, total_checked, compliant, non_compliant, skipped
 
@@ -222,23 +226,22 @@ def check_control(client, project_id):
 # ==================================================
 # CSV
 # ==================================================
-def write_csv(results, project_id):
+def write_csv(results, account_id):
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-    filename = f"gcp_kms_no_public_access_{project_id}_{timestamp}.csv"
+    filename = f"kms_key_not_publicly_accessible_{account_id}_{timestamp}.csv"
 
     with open(filename, "w", newline="") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["Project", "Location", "KeyRing", "CryptoKeyName", "ResourceName", "Status", "Evidence"]
+            fieldnames=["Account", "Region", "KeyId", "KeyArn", "Status", "Evidence"]
         )
         writer.writeheader()
         for row in results:
             writer.writerow({
-                "Project": project_id,
-                "Location": row["Location"],
-                "KeyRing": row["KeyRing"],
-                "CryptoKeyName": row["CryptoKeyName"],
-                "ResourceName": row["ResourceName"],
+                "Account": account_id,
+                "Region": row["Region"],
+                "KeyId": row["KeyId"],
+                "KeyArn": row["KeyArn"],
                 "Status": row["Status"],
                 "Evidence": row["Evidence"]
             })
@@ -251,29 +254,28 @@ def write_csv(results, project_id):
 # ==================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="Check Cloud KMS keys do not grant access to allUsers or allAuthenticatedUsers."
+        description="Check AWS KMS keys do not grant public access (Principal '*') via their key policy."
     )
-    parser.add_argument("-P", "--project", required=True, help="GCP Project ID to audit")
-    parser.add_argument(
-        "-C", "--credentials-file",
-        help="Path to a service account JSON key file. If omitted, uses Application Default Credentials.",
-        default=None
-    )
+    parser.add_argument("-R", "--role-arn", required=True, help="IAM Role ARN to assume, e.g. arn:aws:iam::123456789012:role/MyRole")
+    parser.add_argument("--regions", nargs="*", default=None, help="Optional list of regions to scan (default: all enabled regions)")
     args = parser.parse_args()
 
-    client = get_client(args.credentials_file)
+    account_id = args.role_arn.split(":")[4]
 
-    control_name = "Cloud KMS - Key Does Not Grant Access to allUsers or allAuthenticatedUsers"
+    session = assume_role(args.role_arn)
+    regions = get_regions(session, args.regions)
 
-    results, total_checked, compliant, non_compliant, skipped = check_control(client, args.project)
+    control_name = "KMS - Key Does Not Grant Public Access via Key Policy"
+
+    results, total_checked, compliant, non_compliant, skipped = check_control(session, regions)
 
     overall = "COMPLIANT" if non_compliant == 0 else "NON_COMPLIANT"
 
-    csv_file = write_csv(results, args.project)
+    csv_file = write_csv(results, account_id)
 
     print("\n====================================================")
     print(f"CONTROL: {control_name}")
-    print(f"PROJECT: {args.project}")
+    print(f"ACCOUNT: {account_id}")
     print("====================================================")
     print(f"Total Checked   : {total_checked}")
     print(f"Compliant       : {compliant}")
